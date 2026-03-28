@@ -12,15 +12,151 @@
 #include "CesiumGuidColorManager.h"
 #include "Cesium3DTileset.h"
 #include "Cesium3DTilesetLifecycleEventReceiver.h"
+#include "CesiumFeatureIdSet.h"
+#include "CesiumFeaturesMetadataComponent.h"
 #include "CesiumLoadedTile.h"
 #include "CesiumModelMetadata.h"
 #include "CesiumPropertyTable.h"
 #include "CesiumPropertyTableProperty.h"
+#include "Components/InstancedStaticMeshComponent.h"
 #include "Components/PrimitiveComponent.h"
+#include "EncodedFeaturesMetadata.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "UObject/UObjectGlobals.h"
+
+namespace {
+
+// ============================================================
+// JSCZ: 判断某个属性表是否被 CesiumFeaturesMetadataComponent 配置启用
+// 若场景中未挂该组件，或其描述数组为空，则默认不过滤，保持兼容
+// ============================================================
+bool isPropertyTableEnabledForGuid(
+    const UCesiumFeaturesMetadataComponent* pFeaturesMetadataComponent,
+    const FString& requestedPropertyTableName,
+    const FString& tableName,
+    const FString& guidPropertyName) {
+  if (!requestedPropertyTableName.IsEmpty() &&
+      !tableName.Equals(requestedPropertyTableName)) {
+    return false;
+  }
+
+  if (!IsValid(pFeaturesMetadataComponent)) {
+    return true;
+  }
+
+  const TArray<FCesiumPropertyTableDescription>& propertyTableDescriptions =
+      pFeaturesMetadataComponent->Description.ModelMetadata.PropertyTables;
+  if (propertyTableDescriptions.Num() == 0) {
+    return true;
+  }
+
+  const FCesiumPropertyTableDescription* pDescription =
+      propertyTableDescriptions.FindByPredicate(
+          [&tableName](const FCesiumPropertyTableDescription& description) {
+            return description.Name == tableName;
+          });
+  if (!pDescription) {
+    return false;
+  }
+
+  return pDescription->Properties.Num() == 0 ||
+         pDescription->Properties.ContainsByPredicate(
+             [&guidPropertyName](
+                 const FCesiumPropertyTablePropertyDescription& property) {
+               return property.Name == guidPropertyName;
+             });
+}
+
+// ============================================================
+// JSCZ: 判断某个 FeatureIdSet 是否被 CesiumFeaturesMetadataComponent 描述选中
+// 需要同时匹配自动生成/配置的 FeatureIdSet 名称以及其关联的属性表名
+// ============================================================
+bool isFeatureIdSetEnabled(
+    const UCesiumFeaturesMetadataComponent* pFeaturesMetadataComponent,
+    const FString& featureIdSetName,
+    const FString& propertyTableName) {
+  if (!IsValid(pFeaturesMetadataComponent)) {
+    return true;
+  }
+
+  const TArray<FCesiumFeatureIdSetDescription>& featureIdSetDescriptions =
+      pFeaturesMetadataComponent->Description.PrimitiveFeatures.FeatureIdSets;
+  if (featureIdSetDescriptions.Num() == 0) {
+    return true;
+  }
+
+  return featureIdSetDescriptions.ContainsByPredicate(
+      [&featureIdSetName,
+       &propertyTableName](const FCesiumFeatureIdSetDescription& description) {
+        return description.Name == featureIdSetName &&
+               description.PropertyTableName == propertyTableName;
+      });
+}
+
+// ============================================================
+// JSCZ: 收集当前图元实际关联到的 FeatureID
+// Attribute / Implicit 通过顶点遍历，Instance 通过实例遍历，
+// Texture 类型退化为 featureCount 范围，以避免整张属性表误扫
+// ============================================================
+void collectFeatureIdsForSet(
+    const FCesiumPrimitiveFeatures& primitiveFeatures,
+    const FCesiumFeatureIdSet& featureIdSet,
+    const UPrimitiveComponent& primitiveComponent,
+    TSet<int64>& outFeatureIds) {
+  const ECesiumFeatureIdSetType featureIdSetType =
+      UCesiumFeatureIdSetBlueprintLibrary::GetFeatureIDSetType(featureIdSet);
+  const int64 nullFeatureId =
+      UCesiumFeatureIdSetBlueprintLibrary::GetNullFeatureID(featureIdSet);
+
+  if (featureIdSetType == ECesiumFeatureIdSetType::Instance ||
+      featureIdSetType == ECesiumFeatureIdSetType::InstanceImplicit) {
+    const UInstancedStaticMeshComponent* pInstancedComponent =
+        Cast<UInstancedStaticMeshComponent>(&primitiveComponent);
+    const int32 instanceCount = IsValid(pInstancedComponent)
+                                    ? pInstancedComponent->GetInstanceCount()
+                                    : 0;
+
+    for (int32 instanceIndex = 0; instanceIndex < instanceCount;
+         ++instanceIndex) {
+      const int64 featureId =
+          UCesiumFeatureIdSetBlueprintLibrary::GetFeatureIDForInstance(
+              featureIdSet,
+              instanceIndex);
+      if (featureId >= 0 && featureId != nullFeatureId) {
+        outFeatureIds.Add(featureId);
+      }
+    }
+    return;
+  }
+
+  if (featureIdSetType == ECesiumFeatureIdSetType::Texture) {
+    const int64 featureCount =
+        UCesiumFeatureIdSetBlueprintLibrary::GetFeatureCount(featureIdSet);
+    for (int64 featureId = 0; featureId < featureCount; ++featureId) {
+      if (featureId != nullFeatureId) {
+        outFeatureIds.Add(featureId);
+      }
+    }
+    return;
+  }
+
+  const int64 vertexCount =
+      UCesiumPrimitiveFeaturesBlueprintLibrary::GetVertexCount(
+          primitiveFeatures);
+  for (int64 vertexIndex = 0; vertexIndex < vertexCount; ++vertexIndex) {
+    const int64 featureId =
+        UCesiumFeatureIdSetBlueprintLibrary::GetFeatureIDForVertex(
+            featureIdSet,
+            vertexIndex);
+    if (featureId >= 0 && featureId != nullFeatureId) {
+      outFeatureIds.Add(featureId);
+    }
+  }
+}
+
+} // namespace
 
 // ============================================================
 // JSCZ: 构造函数
@@ -131,8 +267,7 @@ void UCesiumGuidColorManager::ClearAllCategories() {
 // JSCZ: ClearCategory
 // 清除指定颜色分类下的所有 GUID，并实时刷新对应高亮
 // ============================================================
-void UCesiumGuidColorManager::ClearCategory(
-    ECesiumGuidColorCategory Category) {
+void UCesiumGuidColorManager::ClearCategory(ECesiumGuidColorCategory Category) {
   // 收集需要移除的 GUID 键
   TArray<FString> KeysToRemove;
   KeysToRemove.Reserve(GuidColorMap.Num() / 4); // 预估25%的条目（初始容量估算）
@@ -222,8 +357,7 @@ void UCesiumGuidColorManager::ApplyColorCommand(const FString& Command) {
       ClearAllCategories();
     } else if (GuidListStr.Equals(TEXT("Red"), ESearchCase::IgnoreCase)) {
       ClearCategory(ECesiumGuidColorCategory::Red);
-    } else if (
-        GuidListStr.Equals(TEXT("Yellow"), ESearchCase::IgnoreCase)) {
+    } else if (GuidListStr.Equals(TEXT("Yellow"), ESearchCase::IgnoreCase)) {
       ClearCategory(ECesiumGuidColorCategory::Yellow);
     } else if (GuidListStr.Equals(TEXT("Green"), ESearchCase::IgnoreCase)) {
       ClearCategory(ECesiumGuidColorCategory::Green);
@@ -264,38 +398,67 @@ void UCesiumGuidColorManager::ApplyColorCommand(const FString& Command) {
 //
 // 每个 UCesiumGltfPrimitiveComponent 加载完成并创建材质后调用。
 // 流程：
-//   1. 从 glTF metadata 属性表中提取所有 GUID
-//   2. 通过 GuidColorMap 查找每个 GUID 的颜色分类（O(1)）
-//   3. 取优先级最高的颜色（Red > Yellow > Green > None）
-//   4. 将颜色应用到材质实例 Vector 参数 或 CustomDepth Stencil
-//   5. 将本图元记录到 LoadedPrimitives，供后续分类变更时实时更新
+//   1. 从当前图元的 FeatureIdSets 找到它关联的 PropertyTable
+//   2. 通过 FeatureID 仅提取当前图元真正关联的 GUID
+//   3. 通过 GuidColorMap 查找每个 GUID 的颜色分类（O(1)）
+//   4. 取优先级最高的颜色（Red > Yellow > Green > None）
+//   5. 将颜色应用到材质实例 Vector 参数 或 CustomDepth Stencil
+//   6. 将本图元记录到 LoadedPrimitives，供后续分类变更时实时更新
 // ============================================================
 void UCesiumGuidColorManager::CustomizeMaterial(
     ICesiumLoadedTilePrimitive& TilePrimitive,
     UMaterialInstanceDynamic& Material,
     const UCesiumMaterialUserData* CesiumData,
     const CesiumGltf::Material& GltfMaterial) {
-
-  // 获取图元所属 Tile 的 metadata
   ICesiumLoadedTile& LoadedTile = TilePrimitive.GetLoadedTile();
   const FCesiumModelMetadata& ModelMetadata = LoadedTile.GetModelMetadata();
+  ACesium3DTileset& TilesetActor = LoadedTile.GetTilesetActor();
+  const UCesiumFeaturesMetadataComponent* pFeaturesMetadataComponent =
+      TilesetActor.FindComponentByClass<UCesiumFeaturesMetadataComponent>();
+  const FCesiumPrimitiveFeatures& PrimitiveFeatures =
+      TilePrimitive.GetPrimitiveFeatures();
+  const TArray<FCesiumFeatureIdSet>& FeatureIdSets =
+      UCesiumPrimitiveFeaturesBlueprintLibrary::GetFeatureIDSets(
+          PrimitiveFeatures);
 
-  // 获取所有属性表
   const TArray<FCesiumPropertyTable>& PropertyTables =
       UCesiumModelMetadataBlueprintLibrary::GetPropertyTables(ModelMetadata);
 
-  // 收集该图元所有属性表中的 GUID 列表
-  TArray<FString> FoundGuids;
+  // 收集该图元真正关联到的 GUID，避免把整张属性表误绑定到单个图元
+  TSet<FString> FoundGuidSet;
+  int32 FeatureIdTextureCounter = 0;
 
-  for (const FCesiumPropertyTable& Table : PropertyTables) {
-    // 若指定了属性表名称则跳过不匹配的表
-    const FString TableName =
-        UCesiumPropertyTableBlueprintLibrary::GetPropertyTableName(Table);
-    if (!PropertyTableName.IsEmpty() && !TableName.Equals(PropertyTableName)) {
+  for (const FCesiumFeatureIdSet& FeatureIdSet : FeatureIdSets) {
+    const int64 PropertyTableIndex =
+        UCesiumFeatureIdSetBlueprintLibrary::GetPropertyTableIndex(
+            FeatureIdSet);
+    if (PropertyTableIndex < 0 || PropertyTableIndex >= PropertyTables.Num()) {
+      EncodedFeaturesMetadata::getNameForFeatureIDSet(
+          FeatureIdSet,
+          FeatureIdTextureCounter);
       continue;
     }
 
-    // 查找 GUID 属性列
+    const FString FeatureIdSetName =
+        EncodedFeaturesMetadata::getNameForFeatureIDSet(
+            FeatureIdSet,
+            FeatureIdTextureCounter);
+    const FCesiumPropertyTable& Table = PropertyTables[PropertyTableIndex];
+    const FString TableName =
+        UCesiumPropertyTableBlueprintLibrary::GetPropertyTableName(Table);
+
+    if (!isFeatureIdSetEnabled(
+            pFeaturesMetadataComponent,
+            FeatureIdSetName,
+            TableName) ||
+        !isPropertyTableEnabledForGuid(
+            pFeaturesMetadataComponent,
+            PropertyTableName,
+            TableName,
+            GuidPropertyName)) {
+      continue;
+    }
+
     const FCesiumPropertyTableProperty& GuidProperty =
         UCesiumPropertyTableBlueprintLibrary::FindProperty(
             Table,
@@ -303,37 +466,40 @@ void UCesiumGuidColorManager::CustomizeMaterial(
 
     // 检查属性是否有效
     const ECesiumPropertyTablePropertyStatus Status =
-        UCesiumPropertyTablePropertyBlueprintLibrary::GetPropertyTablePropertyStatus(
-            GuidProperty);
+        UCesiumPropertyTablePropertyBlueprintLibrary::
+            GetPropertyTablePropertyStatus(GuidProperty);
     if (Status != ECesiumPropertyTablePropertyStatus::Valid &&
         Status !=
             ECesiumPropertyTablePropertyStatus::EmptyPropertyWithDefault) {
       continue;
     }
 
-    // 获取属性表行数（即特征数量）
-    const int64 FeatureCount =
+    const int64 PropertyTableCount =
         UCesiumPropertyTableBlueprintLibrary::GetPropertyTableCount(Table);
+    TSet<int64> FeatureIds;
+    collectFeatureIdsForSet(
+        PrimitiveFeatures,
+        FeatureIdSet,
+        TilePrimitive.GetMeshComponent(),
+        FeatureIds);
 
-    // 预分配空间，避免多次扩容
-    FoundGuids.Reserve(FoundGuids.Num() + static_cast<int32>(FeatureCount));
+    for (int64 FeatureID : FeatureIds) {
+      if (FeatureID < 0 || FeatureID >= PropertyTableCount) {
+        continue;
+      }
 
-    // 遍历所有特征行，提取 GUID 字符串
-    for (int64 FeatureID = 0; FeatureID < FeatureCount; ++FeatureID) {
-      FString GuidValue = UCesiumPropertyTablePropertyBlueprintLibrary::GetString(
-          GuidProperty,
-          FeatureID,
-          TEXT(""));
+      FString GuidValue =
+          UCesiumPropertyTablePropertyBlueprintLibrary::GetString(
+              GuidProperty,
+              FeatureID,
+              TEXT(""));
       if (!GuidValue.IsEmpty()) {
-        FoundGuids.Add(MoveTemp(GuidValue));
+        FoundGuidSet.Add(MoveTemp(GuidValue));
       }
     }
-
-    // 若找到至少一个 GUID 且未要求遍历所有表则可以提前结束
-    if (!PropertyTableName.IsEmpty() && FoundGuids.Num() > 0) {
-      break;
-    }
   }
+
+  TArray<FString> FoundGuids = FoundGuidSet.Array();
 
   // 根据找到的 GUID 计算最终颜色分类
   const ECesiumGuidColorCategory EffectiveCategory =

@@ -59,9 +59,9 @@ struct CESIUMRUNTIME_API FJsczLoadedPrimitive {
 // 功能说明：
 //   本组件通过实现 ICesium3DTilesetLifecycleEventReceiver 接口，
 //   在 ACesium3DTileset 动态加载/卸载 3D Tiles 时自动关联，
-//   从每个加载的 UCesiumGltfComponent（Tile）的 glTF metadata
-//   属性表中批量提取 GUID，并根据预设的分类（红/黄/绿）对
-//   对应的建筑模型进行高亮渲染。
+//   从每个加载图元的 FeatureIdSets / PropertyTables 中解析出
+//   实际关联的 GUID，并根据预设的分类（红/黄/绿）对对应模型
+//   进行高亮渲染。
 //
 // 支持规模：
 //   可处理最多10万条 GUID，使用 TMap 实现 O(1) 查找，不卡顿。
@@ -99,7 +99,7 @@ public:
   // ============================================================
 
   /**
-   * glTF metadata 属性表中存储 GUID 的属性名称。
+   * PropertyTable 中存储 GUID 的属性名称。
    * 例如 "guid"、"id"、"buildingId" 等，需与数据实际字段名一致。
    */
   UPROPERTY(
@@ -239,10 +239,7 @@ public:
    * @param Guid 要查询的 GUID 字符串
    * @return 该 GUID 的颜色分类，不存在则返回 None
    */
-  UFUNCTION(
-      BlueprintCallable,
-      BlueprintPure,
-      Category = "Cesium|JSCZ")
+  UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Cesium|JSCZ")
   ECesiumGuidColorCategory GetGuidCategory(const FString& Guid) const;
 
   /**
@@ -251,19 +248,13 @@ public:
    * @param Category 要查询的颜色分类
    * @return 该分类下的 GUID 字符串数组
    */
-  UFUNCTION(
-      BlueprintCallable,
-      BlueprintPure,
-      Category = "Cesium|JSCZ")
+  UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Cesium|JSCZ")
   TArray<FString> GetGuidsInCategory(ECesiumGuidColorCategory Category) const;
 
   /**
    * 获取当前已注册的 GUID 总数（含所有分类）。
    */
-  UFUNCTION(
-      BlueprintCallable,
-      BlueprintPure,
-      Category = "Cesium|JSCZ")
+  UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Cesium|JSCZ")
   int32 GetTotalGuidCount() const;
 
   // ============================================================
@@ -296,7 +287,7 @@ public:
 
   /**
    * Tile图元材质定制回调。
-   * 从图元的 glTF metadata 属性表中提取 GUID，
+   * 从图元的 FeatureIdSets / PropertyTables 中提取 GUID，
    * 查找颜色分类并设置材质高亮颜色参数。
    * 同时将该图元注册到 LoadedPrimitives 列表供后续更新使用。
    */
