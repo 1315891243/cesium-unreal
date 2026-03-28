@@ -1,10 +1,13 @@
 // Copyright 2020-2025 CesiumGS, Inc. and Contributors
 // JSCZ - GUID颜色管理器实现
+// 核心逻辑：通过 CesiumFeaturesMetadataComponent 获取 FeatureIdSets
+// 和 PropertyTables，以属性值作为 GUID，通过材质赋予面颜色
 
 #include "CesiumGuidColorManager.h"
 
 #include "Cesium3DTileset.h"
 #include "CesiumFeatureIdSet.h"
+#include "CesiumFeaturesMetadataComponent.h"
 #include "CesiumModelMetadata.h"
 #include "CesiumPrimitiveFeatures.h"
 #include "CesiumPropertyTable.h"
@@ -16,14 +19,12 @@
 #pragma region JSCZ
 
 UCesiumGuidColorManager::UCesiumGuidColorManager() {
-  // 此组件不需要每帧 Tick
   PrimaryComponentTick.bCanEverTick = false;
 }
 
 void UCesiumGuidColorManager::BeginPlay() {
   Super::BeginPlay();
 
-  // 如果启用自动注册，则在游戏开始时自动查找父级 Tileset 并注册
   if (bAutoRegister) {
     ACesium3DTileset* Tileset = Cast<ACesium3DTileset>(GetOwner());
     if (Tileset) {
@@ -34,7 +35,6 @@ void UCesiumGuidColorManager::BeginPlay() {
 
 void UCesiumGuidColorManager::EndPlay(
     const EEndPlayReason::Type EndPlayReason) {
-  // 清理所有缓存数据
   CachedPrimitives.Empty();
   ManagedTextures.Empty();
   GuidColorMap.Empty();
@@ -43,17 +43,40 @@ void UCesiumGuidColorManager::EndPlay(
 }
 
 void UCesiumGuidColorManager::RegisterWithTileset(ACesium3DTileset* Tileset) {
-  if (Tileset) {
-    // 将自身注册为 Tileset 的生命周期事件接收器
-    // 此后所有新加载的瓦片都会触发 CustomizeMaterial 等回调
-    Tileset->SetLifecycleEventReceiver(this);
+  if (!Tileset) {
+    return;
   }
+
+  // 检查 Tileset 上是否存在 CesiumFeaturesMetadataComponent
+  // 这是使用 GUID 着色的前提条件：必须先配置好 FeatureIdSets 和 PropertyTables
+  UCesiumFeaturesMetadataComponent* FeaturesMetadata =
+      Tileset->FindComponentByClass<UCesiumFeaturesMetadataComponent>();
+  if (!FeaturesMetadata) {
+    UE_LOG(
+        LogTemp,
+        Warning,
+        TEXT("[JSCZ] UCesiumGuidColorManager::RegisterWithTileset: "
+             "Tileset 上未找到 CesiumFeaturesMetadataComponent！"
+             "必须先添加并配置该组件（Description 中的 FeatureIdSets "
+             "和 PropertyTables），否则 FeatureID 不会被编码到材质中。"));
+  }
+
+  // 注册为 Tileset 的生命周期事件接收器
+  Tileset->SetLifecycleEventReceiver(this);
+
+  UE_LOG(
+      LogTemp,
+      Log,
+      TEXT("[JSCZ] UCesiumGuidColorManager: 已注册到 Tileset [%s], "
+           "FeatureIdSetIndex=%d, GuidPropertyName=%s"),
+      *Tileset->GetName(),
+      FeatureIdSetIndex,
+      *GuidPropertyName);
 }
 
 void UCesiumGuidColorManager::SetGuidColors(
     const TArray<FString>& Guids,
     FLinearColor Color) {
-  // 将每个 GUID 添加到颜色映射表中
   for (const FString& Guid : Guids) {
     GuidColorMap.Add(Guid, Color);
   }
@@ -61,34 +84,26 @@ void UCesiumGuidColorManager::SetGuidColors(
 
 void UCesiumGuidColorManager::RemoveGuidColors(
     const TArray<FString>& Guids) {
-  // 从颜色映射表中移除指定的 GUID
   for (const FString& Guid : Guids) {
     GuidColorMap.Remove(Guid);
   }
 }
 
 void UCesiumGuidColorManager::ClearAllGuidColors() {
-  // 清空整个颜色映射表
   GuidColorMap.Empty();
 }
 
 void UCesiumGuidColorManager::RefreshAllColors() {
-  // 先清理已失效的缓存条目
   CleanupStaleCacheEntries();
 
-  // 遍历所有缓存的图元，根据最新的颜色映射重新生成颜色数据
   for (FPrimitiveColorInfo& Info : CachedPrimitives) {
     if (!Info.Material.IsValid() || !Info.ColorTexture) {
       continue;
     }
 
-    // 使用最新的 GuidColorMap 重新构建颜色数组
     TArray<FLinearColor> Colors = BuildColorArray(Info.FeatureGuids);
-
-    // 原地更新纹理数据（不重新创建纹理对象）
     UpdateColorTexture(Info.ColorTexture, Colors);
 
-    // 重新设置材质参数确保更新生效
     Info.Material->SetTextureParameterValue(
         ColorTexParameterName, Info.ColorTexture);
   }
@@ -101,30 +116,30 @@ void UCesiumGuidColorManager::CustomizeMaterial(
     const CesiumGltf::Material& GltfMaterial) {
   // ===== 核心逻辑：瓦片动态加载时自动着色 =====
   //
-  // 流程：
-  // 1. 从图元的要素数据中读取每个要素的 GUID
-  // 2. 根据 GuidColorMap 查找每个 GUID 对应的颜色
-  // 3. 生成颜色查找纹理（每个像素 = 一个要素的颜色）
-  // 4. 将纹理设置到材质参数中
+  // 正确流程（通过 CesiumFeaturesMetadataComponent 配置的数据）：
+  // 1. 从图元获取 FeatureIdSets（CesiumFeaturesMetadataComponent 已编码到材质）
+  // 2. 使用 FeatureIdSetIndex 选择指定的 FeatureIdSet
+  // 3. 通过 FeatureIdSet 的 PropertyTableIndex 找到关联的 PropertyTable
+  // 4. 从 PropertyTable 中读取 GuidPropertyName 属性的值 → 作为 GUID
+  // 5. 查 GuidColorMap 得到颜色 → 生成颜色纹理 → 设到材质参数
 
-  // 步骤1：读取此图元所有要素的 GUID
+  // 步骤1-4：读取此图元所有要素的 GUID
   TArray<FString> FeatureGuids = ReadFeatureGuids(TilePrimitive);
 
-  // 如果没有要素或没有 GUID 属性，跳过此图元
   if (FeatureGuids.Num() == 0) {
     return;
   }
 
-  // 步骤2：根据当前颜色映射构建颜色数组
+  // 步骤5a：根据当前颜色映射构建颜色数组
   TArray<FLinearColor> Colors = BuildColorArray(FeatureGuids);
 
-  // 步骤3：创建颜色查找纹理
+  // 步骤5b：创建颜色查找纹理
   UTexture2D* ColorTexture = CreateColorTexture(FeatureGuids.Num(), Colors);
   if (!ColorTexture) {
     return;
   }
 
-  // 步骤4：设置材质纹理参数
+  // 步骤5c：设置材质纹理参数（材质 Shader 使用此纹理按 FeatureID 采样颜色）
   Material.SetTextureParameterValue(ColorTexParameterName, ColorTexture);
 
   // 设置纹理尺寸参数（供材质 Shader 计算 UV 坐标）
@@ -138,7 +153,7 @@ void UCesiumGuidColorManager::CustomizeMaterial(
           0.0f,
           0.0f));
 
-  // 缓存信息，用于后续调用 RefreshAllColors() 时更新
+  // 缓存信息，用于后续 RefreshAllColors() 更新
   FPrimitiveColorInfo CacheInfo;
   CacheInfo.Material = &Material;
   CacheInfo.ColorTexture = ColorTexture;
@@ -147,8 +162,6 @@ void UCesiumGuidColorManager::CustomizeMaterial(
 }
 
 void UCesiumGuidColorManager::OnTileUnloading(ICesiumLoadedTile& Tile) {
-  // 瓦片卸载时，清理无效的缓存条目
-  // 被卸载瓦片的材质将变为无效，延迟清理策略会在下次访问时移除
   CleanupStaleCacheEntries();
 }
 
@@ -156,7 +169,12 @@ TArray<FString> UCesiumGuidColorManager::ReadFeatureGuids(
     ICesiumLoadedTilePrimitive& TilePrimitive) const {
   TArray<FString> Result;
 
-  // 获取图元的要素ID集合（FeatureIdSet）
+  // ===== 从 FeatureIdSets 获取要素ID集合 =====
+  //
+  // FeatureIdSets 来源于 CesiumFeaturesMetadataComponent 的 Description 配置。
+  // 只有在 Description.PrimitiveFeatures.FeatureIdSets 中配置的集合
+  // 才会被 Cesium 编码到材质参数中（_FEATURE_ID_N）。
+
   const FCesiumPrimitiveFeatures& Features =
       TilePrimitive.GetPrimitiveFeatures();
   const TArray<FCesiumFeatureIdSet>& FeatureIdSets =
@@ -166,53 +184,92 @@ TArray<FString> UCesiumGuidColorManager::ReadFeatureGuids(
     return Result;
   }
 
-  // 获取模型元数据中的属性表（PropertyTable）
-  const FCesiumModelMetadata& ModelMetadata =
-      TilePrimitive.GetLoadedTile().GetModelMetadata();
-  TArray<FCesiumPropertyTable> PropertyTables =
-      UCesiumModelMetadataBlueprintLibrary::GetPropertyTables(ModelMetadata);
-
-  if (PropertyTables.Num() == 0) {
+  // 使用指定索引的 FeatureIdSet
+  if (FeatureIdSetIndex < 0 || FeatureIdSetIndex >= FeatureIdSets.Num()) {
+    UE_LOG(
+        LogTemp,
+        Warning,
+        TEXT("[JSCZ] ReadFeatureGuids: FeatureIdSetIndex=%d 超出范围 "
+             "[0, %d)，请检查 CesiumFeaturesMetadataComponent 的 "
+             "Description.PrimitiveFeatures.FeatureIdSets 配置"),
+        FeatureIdSetIndex,
+        FeatureIdSets.Num());
     return Result;
   }
 
-  // 遍历要素ID集合，查找包含 GUID 属性的属性表
-  for (const FCesiumFeatureIdSet& FeatureIdSet : FeatureIdSets) {
-    // 获取此要素ID集合关联的属性表索引
-    int64 TableIndex =
-        UCesiumFeatureIdSetBlueprintLibrary::GetPropertyTableIndex(
-            FeatureIdSet);
+  const FCesiumFeatureIdSet& SelectedFeatureIdSet =
+      FeatureIdSets[FeatureIdSetIndex];
 
-    if (TableIndex < 0 || TableIndex >= PropertyTables.Num()) {
-      continue;
-    }
-
-    const FCesiumPropertyTable& Table = PropertyTables[TableIndex];
-
-    // 获取属性表中所有属性，检查是否包含 GUID 属性
-    TMap<FString, FCesiumPropertyTableProperty> Properties =
-        UCesiumPropertyTableBlueprintLibrary::GetProperties(Table);
-
-    FCesiumPropertyTableProperty* GuidProp = Properties.Find(GuidPropertyName);
-    if (!GuidProp) {
-      continue;
-    }
-
-    // 找到了 GUID 属性，读取所有要素的 GUID 值
-    int64 FeatureCount =
-        UCesiumPropertyTablePropertyBlueprintLibrary::GetPropertySize(
-            *GuidProp);
-
-    Result.SetNum(FeatureCount);
-    for (int64 i = 0; i < FeatureCount; i++) {
-      Result[i] = UCesiumPropertyTablePropertyBlueprintLibrary::GetString(
-          *GuidProp,
-          i,
-          TEXT(""));
-    }
-
-    // 使用第一个匹配的属性表
+  // 获取此 FeatureIdSet 的要素数量
+  int64 FeatureCount =
+      UCesiumFeatureIdSetBlueprintLibrary::GetFeatureCount(
+          SelectedFeatureIdSet);
+  if (FeatureCount <= 0) {
     return Result;
+  }
+
+  // ===== 通过 PropertyTableIndex 找到关联的 PropertyTable =====
+  //
+  // FeatureIdSet 通过 PropertyTableIndex 关联到 PropertyTable。
+  // PropertyTable 存储在 ModelMetadata 中（由 CesiumFeaturesMetadataComponent
+  // 的 Description.ModelMetadata.PropertyTables 配置）。
+
+  int64 TableIndex =
+      UCesiumFeatureIdSetBlueprintLibrary::GetPropertyTableIndex(
+          SelectedFeatureIdSet);
+
+  const FCesiumModelMetadata& ModelMetadata =
+      TilePrimitive.GetLoadedTile().GetModelMetadata();
+  const TArray<FCesiumPropertyTable>& PropertyTables =
+      UCesiumModelMetadataBlueprintLibrary::GetPropertyTables(ModelMetadata);
+
+  if (TableIndex < 0 || TableIndex >= PropertyTables.Num()) {
+    UE_LOG(
+        LogTemp,
+        Warning,
+        TEXT("[JSCZ] ReadFeatureGuids: FeatureIdSet[%d] 的 "
+             "PropertyTableIndex=%lld 无效（PropertyTable数量=%d）。"
+             "请检查 CesiumFeaturesMetadataComponent 配置。"),
+        FeatureIdSetIndex,
+        TableIndex,
+        PropertyTables.Num());
+    return Result;
+  }
+
+  const FCesiumPropertyTable& Table = PropertyTables[TableIndex];
+
+  // ===== 从 PropertyTable 中读取 GUID 属性值 =====
+  //
+  // PropertyTable 内部存储了多个属性（Property），
+  // 其中 GuidPropertyName 对应的属性值作为 GUID 标识符。
+  // 每个要素ID（0, 1, 2...）对应一个属性值。
+
+  const TMap<FString, FCesiumPropertyTableProperty>& Properties =
+      UCesiumPropertyTableBlueprintLibrary::GetProperties(Table);
+
+  const FCesiumPropertyTableProperty* GuidProp =
+      Properties.Find(GuidPropertyName);
+  if (!GuidProp) {
+    UE_LOG(
+        LogTemp,
+        Warning,
+        TEXT("[JSCZ] ReadFeatureGuids: PropertyTable[%lld] 中未找到属性 "
+             "'%s'。可用属性："),
+        TableIndex,
+        *GuidPropertyName);
+    for (const auto& Pair : Properties) {
+      UE_LOG(LogTemp, Warning, TEXT("  - %s"), *Pair.Key);
+    }
+    return Result;
+  }
+
+  // 读取每个要素的 GUID 值（按要素ID索引）
+  Result.SetNum(FeatureCount);
+  for (int64 i = 0; i < FeatureCount; i++) {
+    Result[i] = UCesiumPropertyTablePropertyBlueprintLibrary::GetString(
+        *GuidProp,
+        i,
+        TEXT(""));
   }
 
   return Result;
@@ -224,7 +281,6 @@ UCesiumGuidColorManager::BuildColorArray(
   TArray<FLinearColor> Colors;
   Colors.SetNum(FeatureGuids.Num());
 
-  // 根据 GUID 查找颜色映射，未匹配的使用默认颜色
   for (int32 i = 0; i < FeatureGuids.Num(); i++) {
     const FLinearColor* FoundColor = GuidColorMap.Find(FeatureGuids[i]);
     Colors[i] = FoundColor ? *FoundColor : DefaultColor;
@@ -236,38 +292,33 @@ UCesiumGuidColorManager::BuildColorArray(
 UTexture2D* UCesiumGuidColorManager::CreateColorTexture(
     int64 FeatureCount,
     const TArray<FLinearColor>& Colors) {
-  // 安全校验：要素数量必须在有效范围内（最大支持 4096*4096 = 16,777,216 个要素）
+  // 纹理最大尺寸为 4096x4096（GPU 通用限制），最多支持 16,777,216 个要素
   constexpr int64 MaxFeatureCount = 4096LL * 4096LL;
   if (FeatureCount <= 0 || FeatureCount > MaxFeatureCount) {
     return nullptr;
   }
 
-  // 计算纹理尺寸：宽度最大4096像素，超出部分自动换行
   int32 Width = FMath::Min(static_cast<int32>(FeatureCount), 4096);
   int32 Height =
       FMath::CeilToInt(static_cast<float>(FeatureCount) / 4096.0f);
 
-  // 创建临时纹理（非持久化，仅存在于内存中）
   UTexture2D* Texture =
       UTexture2D::CreateTransient(Width, Height, PF_B8G8R8A8);
   if (!Texture) {
     return nullptr;
   }
 
-  // 配置纹理属性
-  Texture->Filter = TF_Nearest;  // 最近邻过滤：精确的要素ID到颜色映射
-  Texture->SRGB = false;         // 线性颜色空间
-  Texture->AddressX = TA_Clamp;  // 边缘钳制
+  Texture->Filter = TF_Nearest;
+  Texture->SRGB = false;
+  Texture->AddressX = TA_Clamp;
   Texture->AddressY = TA_Clamp;
-  Texture->NeverStream = true;  // 不使用纹理流送
+  Texture->NeverStream = true;
 
-  // 校验平台数据和MIP层级是否可用
   FTexturePlatformData* PlatformData = Texture->GetPlatformData();
   if (!PlatformData || PlatformData->Mips.Num() == 0) {
     return nullptr;
   }
 
-  // 填充纹理像素数据
   FTexture2DMipMap& Mip = PlatformData->Mips[0];
   void* Data = Mip.BulkData.Lock(LOCK_READ_WRITE);
   if (!Data) {
@@ -277,11 +328,9 @@ UTexture2D* UCesiumGuidColorManager::CreateColorTexture(
 
   uint8* Pixels = static_cast<uint8*>(Data);
 
-  // 清零所有像素
   int64 TotalPixels = static_cast<int64>(Width) * Height;
   FMemory::Memzero(Pixels, TotalPixels * 4);
 
-  // 逐像素写入颜色数据（BGRA格式）
   for (int64 i = 0; i < FeatureCount && i < Colors.Num(); i++) {
     FColor C = Colors[i].ToFColor(false);
     int64 Offset = i * 4;
@@ -293,10 +342,8 @@ UTexture2D* UCesiumGuidColorManager::CreateColorTexture(
 
   Mip.BulkData.Unlock();
 
-  // 上传纹理数据到 GPU
   Texture->UpdateResource();
 
-  // 添加到管理列表，防止被GC回收
   ManagedTextures.Add(Texture);
 
   return Texture;
@@ -309,7 +356,6 @@ void UCesiumGuidColorManager::UpdateColorTexture(
     return;
   }
 
-  // 校验平台数据和MIP层级是否可用
   FTexturePlatformData* PlatformData = Texture->GetPlatformData();
   if (!PlatformData || PlatformData->Mips.Num() == 0) {
     return;
@@ -327,11 +373,9 @@ void UCesiumGuidColorManager::UpdateColorTexture(
 
   uint8* Pixels = static_cast<uint8*>(Data);
 
-  // 清零所有像素
   int64 TotalPixels = static_cast<int64>(Width) * Height;
   FMemory::Memzero(Pixels, TotalPixels * 4);
 
-  // 重新写入颜色数据
   for (int64 i = 0; i < Colors.Num() && i < TotalPixels; i++) {
     FColor C = Colors[i].ToFColor(false);
     int64 Offset = i * 4;
@@ -343,15 +387,12 @@ void UCesiumGuidColorManager::UpdateColorTexture(
 
   Mip.BulkData.Unlock();
 
-  // 重新上传纹理数据到 GPU
   Texture->UpdateResource();
 }
 
 void UCesiumGuidColorManager::CleanupStaleCacheEntries() {
-  // 从后向前遍历，移除材质已失效的缓存条目
   for (int32 i = CachedPrimitives.Num() - 1; i >= 0; --i) {
     if (!CachedPrimitives[i].Material.IsValid()) {
-      // 材质已被销毁，同时释放对应的纹理
       UTexture2D* Tex = CachedPrimitives[i].ColorTexture;
       if (Tex) {
         ManagedTextures.Remove(Tex);

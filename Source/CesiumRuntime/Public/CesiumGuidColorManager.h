@@ -1,5 +1,6 @@
 // Copyright 2020-2025 CesiumGS, Inc. and Contributors
-// JSCZ - GUID颜色管理器：瓦片动态加载时自动根据GUID着色
+// JSCZ - GUID颜色管理器：通过 CesiumFeaturesMetadataComponent 获取
+//        FeatureIdSets 和 PropertyTables，以属性值作为GUID进行着色
 
 #pragma once
 
@@ -14,6 +15,7 @@ class ACesium3DTileset;
 class UTexture2D;
 class UMaterialInstanceDynamic;
 class UCesiumMaterialUserData;
+class UCesiumFeaturesMetadataComponent;
 
 namespace CesiumGltf {
 struct Material;
@@ -23,20 +25,36 @@ struct Material;
  * GUID颜色管理组件 (CesiumGuidColorManager)
  *
  * 将此组件添加到 ACesium3DTileset Actor 上，可实现基于GUID的自动着色。
- * 当3DTiles瓦片动态加载时（UCesiumGltfComponent），组件会自动：
- * 1. 读取每个要素（Feature）的GUID属性值
- * 2. 根据预设的 GUID → 颜色 映射表查找颜色
- * 3. 生成颜色查找纹理并设置到材质参数中
  *
- * 用法示例：
- * - 将此组件添加到 Cesium3DTileset Actor
- * - 设置 GuidPropertyName 为元数据中 GUID 属性的名称
- * - 调用 SetGuidColors() 设定 GUID 数组和对应颜色
- * - 新加载的瓦片会自动显示正确颜色
- * - 调用 RefreshAllColors() 可刷新已加载瓦片的颜色
+ * ========== 核心数据流（正确架构） ==========
  *
- * 注意：使用的材质中需包含名为 ColorTexParameterName 的纹理参数，
- * 以及 ColorTexSizeParameterName 的向量参数（存储纹理尺寸，用于计算UV）。
+ * 前提：Tileset 上必须存在 UCesiumFeaturesMetadataComponent，
+ * 并在其 Description 中配置好 FeatureIdSets 和 PropertyTables。
+ * 这样 Cesium 引擎才会将 FeatureID 和元数据编码到 GPU 材质参数中。
+ *
+ * 数据流：
+ *   CesiumFeaturesMetadataComponent.Description
+ *     → PrimitiveFeatures.FeatureIdSets[FeatureIdSetIndex]
+ *       → FeatureIdSet 关联一个 PropertyTable（通过 PropertyTableIndex）
+ *         → PropertyTable 中的 GuidPropertyName 属性
+ *           → 每个要素的属性值 = GUID 标识符
+ *             → 查 GuidColorMap 得到颜色
+ *               → 生成颜色纹理 → 设到材质参数
+ *
+ * 材质 Shader 端：
+ *   顶点属性 _FEATURE_ID_N → 获取当前面的要素ID
+ *   → 以要素ID为索引，从颜色纹理采样
+ *   → 得到面的颜色
+ *
+ * ========== 使用步骤 ==========
+ *
+ * 1. 在 Tileset 上添加 UCesiumFeaturesMetadataComponent，
+ *    配置 Description 中的 FeatureIdSets 和 PropertyTables
+ * 2. 在 Tileset 上添加本组件
+ * 3. 设置 FeatureIdSetIndex = 要使用的 FeatureIdSet 索引（默认 0）
+ * 4. 设置 GuidPropertyName = PropertyTable 中作为 GUID 的属性名
+ * 5. 调用 SetGuidColors() 设定 GUID → 颜色 映射
+ * 6. 新瓦片自动着色；已加载瓦片调用 RefreshAllColors() 刷新
  */
 UCLASS(
     ClassGroup = "Cesium",
@@ -54,9 +72,32 @@ public:
   UCesiumGuidColorManager();
 
   /**
-   * 元数据中 GUID 属性的名称。
-   * 例如："guid"、"GUID"、"BatchId"、"id" 等。
-   * 组件会在 PropertyTable 中查找此属性，读取每个要素的 GUID 值。
+   * 要使用的 FeatureIdSet 索引（在 PrimitiveFeatures 中的序号）。
+   *
+   * 此索引对应 CesiumFeaturesMetadataComponent.Description
+   * .PrimitiveFeatures.FeatureIdSets 数组中的位置。
+   * 通常第一个 FeatureIdSet（索引0）即为主要的要素ID集合。
+   *
+   * 该 FeatureIdSet 通过 PropertyTableIndex 关联到一个 PropertyTable，
+   * 组件从该表中读取 GuidPropertyName 属性的值作为 GUID。
+   */
+  UPROPERTY(
+      EditAnywhere,
+      BlueprintReadWrite,
+      Category = "JSCZ|GUID Color",
+      meta = (DisplayName = "Feature ID Set Index"))
+  int32 FeatureIdSetIndex = 0;
+
+  /**
+   * PropertyTable 中用作 GUID 标识的属性名称。
+   *
+   * 组件通过 FeatureIdSet → PropertyTable → 此属性名
+   * 读取每个要素的 GUID 字符串值。
+   *
+   * 示例：
+   *   CityGML 数据："gml_id" 或 "id"
+   *   Revit 数据：  "guid" 或 "GUID"
+   *   自定义数据：  查看 PropertyTable 中的实际属性名
    */
   UPROPERTY(
       EditAnywhere,
@@ -114,7 +155,7 @@ public:
    * 为一组 GUID 设置颜色。
    * 同一个 GUID 重复设置时，后设置的颜色会覆盖之前的。
    *
-   * @param Guids  GUID 字符串数组
+   * @param Guids  GUID 字符串数组（值来源于 PropertyTable 中的属性值）
    * @param Color  要应用的颜色
    */
   UFUNCTION(
@@ -158,6 +199,7 @@ public:
   /**
    * 手动注册到指定的 Tileset。
    * 通常在 bAutoRegister = false 时使用。
+   * 注册时会自动检查 Tileset 上是否已有 UCesiumFeaturesMetadataComponent。
    *
    * @param Tileset  目标 Cesium3DTileset Actor
    */
@@ -208,8 +250,12 @@ private:
 
   /**
    * 从图元的要素数据中读取 GUID 列表。
-   * 遍历要素ID集合(FeatureIdSet)，查找关联的属性表(PropertyTable)中的GUID属性，
-   * 读取每个要素的GUID值。
+   *
+   * 正确的数据获取流程：
+   * 1. 从图元获取 FeatureIdSets（由 CesiumFeaturesMetadataComponent 配置编码）
+   * 2. 使用 FeatureIdSetIndex 选择指定的 FeatureIdSet
+   * 3. 通过 FeatureIdSet.PropertyTableIndex 定位关联的 PropertyTable
+   * 4. 从 PropertyTable 中读取 GuidPropertyName 属性的值
    *
    * @return 按要素ID索引的GUID数组，无GUID的要素对应空字符串
    */
@@ -230,7 +276,7 @@ private:
    * 纹理宽度最大4096像素，超出部分自动换行到下一行。
    * 每个像素对应一个要素ID的颜色。
    *
-   * @param FeatureCount 要素数量
+   * @param FeatureCount 要素数量（来自 FeatureIdSet.GetFeatureCount）
    * @param Colors 颜色数组
    * @return 新创建的纹理，失败返回 nullptr
    */
