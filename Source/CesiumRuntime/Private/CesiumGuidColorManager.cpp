@@ -236,7 +236,9 @@ UCesiumGuidColorManager::BuildColorArray(
 UTexture2D* UCesiumGuidColorManager::CreateColorTexture(
     int64 FeatureCount,
     const TArray<FLinearColor>& Colors) {
-  if (FeatureCount <= 0) {
+  // 安全校验：要素数量必须在有效范围内（最大支持 4096*4096 = 16,777,216 个要素）
+  constexpr int64 MaxFeatureCount = 4096LL * 4096LL;
+  if (FeatureCount <= 0 || FeatureCount > MaxFeatureCount) {
     return nullptr;
   }
 
@@ -259,9 +261,20 @@ UTexture2D* UCesiumGuidColorManager::CreateColorTexture(
   Texture->AddressY = TA_Clamp;
   Texture->NeverStream = true;  // 不使用纹理流送
 
+  // 校验平台数据和MIP层级是否可用
+  FTexturePlatformData* PlatformData = Texture->GetPlatformData();
+  if (!PlatformData || PlatformData->Mips.Num() == 0) {
+    return nullptr;
+  }
+
   // 填充纹理像素数据
-  FTexture2DMipMap& Mip = Texture->GetPlatformData()->Mips[0];
+  FTexture2DMipMap& Mip = PlatformData->Mips[0];
   void* Data = Mip.BulkData.Lock(LOCK_READ_WRITE);
+  if (!Data) {
+    Mip.BulkData.Unlock();
+    return nullptr;
+  }
+
   uint8* Pixels = static_cast<uint8*>(Data);
 
   // 清零所有像素
@@ -296,11 +309,22 @@ void UCesiumGuidColorManager::UpdateColorTexture(
     return;
   }
 
+  // 校验平台数据和MIP层级是否可用
+  FTexturePlatformData* PlatformData = Texture->GetPlatformData();
+  if (!PlatformData || PlatformData->Mips.Num() == 0) {
+    return;
+  }
+
   int32 Width = Texture->GetSizeX();
   int32 Height = Texture->GetSizeY();
 
-  FTexture2DMipMap& Mip = Texture->GetPlatformData()->Mips[0];
+  FTexture2DMipMap& Mip = PlatformData->Mips[0];
   void* Data = Mip.BulkData.Lock(LOCK_READ_WRITE);
+  if (!Data) {
+    Mip.BulkData.Unlock();
+    return;
+  }
+
   uint8* Pixels = static_cast<uint8*>(Data);
 
   // 清零所有像素
